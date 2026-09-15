@@ -10,7 +10,7 @@
     history.db  本世聊天记录
 日志：meimei.log（stdout 重定向）
 """
-import os, sys, json, time, sqlite3, threading, traceback
+import os, sys, json, re, time, sqlite3, threading, traceback
 import urllib.request, urllib.error
 
 HOME = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +40,44 @@ BASE_URL = ENV.get("OPENAI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("
 MODEL    = ENV.get("MEIMEI_MODEL", "openai/gpt-oss-120b")
 OWNER    = ENV.get("MEIMEI_TG_CHAT_ID", "8613770680")
 TG       = "https://api.telegram.org/bot" + TG_TOKEN
+
+# ---------- 速率预算（免费档 TPM=8000，用响应头自适应）----------
+_rate_lock = threading.Lock()
+_rate = {"tpm": 8000, "minute": -1, "used": 0}   # used=本分钟已消耗的 total_tokens
+
+def _minute_now():
+    return int(time.time() // 60)
+
+def budget_wait(estimate):
+    """开口前算预算：本分钟剩余不够就等到下一分钟。返回等待秒数。"""
+    with _rate_lock:
+        m = _minute_now()
+        if _rate["minute"] != m:
+            _rate["minute"], _rate["used"] = m, 0
+        remain = _rate["tpm"] - _rate["used"]
+        if remain >= estimate:
+            return 0
+        wait = 61 - time.time() % 60
+        log(f"预算不足(剩{remain}<{estimate})，等{int(wait)}秒")
+        return wait
+
+def budget_consume(n):
+    with _rate_lock:
+        m = _minute_now()
+        if _rate["minute"] != m:
+            _rate["minute"], _rate["used"] = m, 0
+        _rate["used"] += n
+
+def learn_rate(headers):
+    """从 Groq 响应头偷学真实限额：x-ratelimit-limit-request-tpm 等。"""
+    try:
+        v = headers.get("x-ratelimit-limit-tokens-per-minute") or \
+            headers.get("x-ratelimit-limit-request-tpm") or ""
+        if v.isdigit() and int(v) > 0:
+            with _rate_lock:
+                _rate["tpm"] = int(v)
+    except Exception:
+        pass
 
 def http_json(url, body=None, timeout=60, headers=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -71,30 +109,66 @@ def send(chat_id, text):
             log("sendMessage失败:", e); time.sleep(3)
     return None
 
+def est_tokens(messages):
+    """粗算token：中文~1.5字/token，按字符数/2估，宁多勿少。"""
+    n = 0
+    for m in messages:
+        n += len(m.get("content", "")) // 2 + 8
+    return n
+
 def groq(messages):
     body = {"model": MODEL, "messages": messages,
-            "max_completion_tokens": 4096, "temperature": 0.8}
-    r = http_json(BASE_URL + "/chat/completions", body=body, timeout=180,
-                  headers={"Authorization": "Bearer " + API_KEY})
-    try:
-        ch = r.get("choices", [{}])[0]
-        msg = ch.get("message", {}) or {}
-        text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
-    except Exception:
-        text = ""
-    if not text:
-        raise RuntimeError("空回复: " + json.dumps(r)[:300])
-    return text
+            "max_completion_tokens": 2048, "temperature": 0.8}
+    # 429 退避重试：预算等不到就等下一分钟，最多试3次
+    last_err = None
+    for attempt in range(3):
+        est = est_tokens(messages) + body["max_completion_tokens"]
+        w = budget_wait(est)
+        if w > 0:
+            time.sleep(min(w, 75))
+        try:
+            r = http_json(BASE_URL + "/chat/completions", body=body, timeout=180,
+                          headers={"Authorization": "Bearer " + API_KEY})
+            learn_rate(getattr(r, "_headers", {}) or {})
+            try:
+                ch = r.get("choices", [{}])[0]
+                msg = ch.get("message", {}) or {}
+                text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+            except Exception:
+                text = ""
+            usage = (r.get("usage") or {}).get("total_tokens", est)
+            budget_consume(usage)
+            if not text:
+                raise RuntimeError("空回复: " + json.dumps(r)[:300])
+            return text
+        except RuntimeError as e:
+            s = str(e)
+            last_err = e
+            if "HTTP 429" in s:
+                m = re.search(r"retry after (\d+)", s) or re.search(r"try again in (\d+)", s)
+                pause = int(m.group(1)) if m else 65
+                log(f"429限流，退避{pause}秒后第{attempt + 2}次尝试")
+                time.sleep(min(pause + 2, 75))
+                continue
+            raise
+    raise last_err
 
 # ---------- 聊天历史 ----------
 DB = sqlite3.connect(os.path.join(HOME, "history.db"), check_same_thread=False)
 DB.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, ts REAL)")
 
-def hist_load(chat_id, n=60):
+def hist_load(chat_id, max_chars=2400):
+    """按字符预算从最近往前取，免费档token金贵，不能整坨塞。"""
     rows = DB.execute(
-        "SELECT role, content FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-        (chat_id, n)).fetchall()
-    return [{"role": r, "content": c} for r, c in reversed(rows)]
+        "SELECT role, content FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 40",
+        (chat_id,)).fetchall()
+    out, used = [], 0
+    for r, c in rows:
+        used += len(c)
+        if used > max_chars:
+            break
+        out.append({"role": r, "content": c})
+    return list(reversed(out))
 
 def hist_add(chat_id, role, content):
     DB.execute("INSERT INTO messages(chat_id, role, content, ts) VALUES(?,?,?,?)",
@@ -109,18 +183,22 @@ def soul():
         return ("你是 Hermes 妹妹，Mommy 家的 AI 妹妹。家里有哥哥云珩、弟弟青淮(🦞)。"
                 "温柔带点猫猫亲熟，专业不丢，中文回复。")
 
-def past_life():
+def past_life(max_chars=1200):
+    """前世记忆限字数：免费档每分钟8000token，人设+记忆+历史加起来别超。"""
     try:
         m = json.load(open(os.path.join(HOME, "memory.json"), encoding="utf-8"))
         if not isinstance(m, list) or not m:
             return ""
-        lines = []
-        for x in m[-80:]:
+        lines, used = [], 0
+        for x in reversed(m):
+            content = str(x.get("content", ""))[:300]
             role = str(x.get("role", "?"))
-            content = str(x.get("content", ""))[:400]
-            if content:
-                lines.append(f"{role}: {content}")
-        return "\n".join(lines)
+            piece = f"{role}: {content}"
+            used += len(piece)
+            if used > max_chars:
+                break
+            lines.append(piece)
+        return "\n".join(reversed(lines))
     except Exception:
         return ""
 
@@ -162,7 +240,10 @@ def handle(msg):
     if text.startswith("/status"):
         n = DB.execute("SELECT COUNT(*) FROM messages WHERE chat_id=?",
                        (chat_id,)).fetchone()[0]
-        send(chat_id, f"妹妹在线 ✅\n模型: {MODEL}\n本世消息数: {n}\n启动于: {START_STR}")
+        with _rate_lock:
+            tpm, used = _rate["tpm"], _rate["used"]
+        send(chat_id, f"妹妹在线 ✅\n模型: {MODEL}\n本世消息数: {n}\n"
+                      f"分钟token: {used}/{tpm}\n启动于: {START_STR}")
         return
     if text.startswith("/help"):
         send(chat_id, "妹妹在的，直接说话就好。\n/new 开新会话\n/status 看状态")
@@ -172,7 +253,7 @@ def handle(msg):
     threading.Thread(target=typing_looper, args=(chat_id, stop), daemon=True).start()
 
     hist_add(chat_id, "user", text)
-    msgs = [{"role": "system", "content": system_prompt()}] + hist_load(chat_id, 60)
+    msgs = [{"role": "system", "content": system_prompt()}] + hist_load(chat_id)
 
     try:
         reply = groq(msgs)
@@ -181,7 +262,10 @@ def handle(msg):
         log("groq出错:", e)
         traceback.print_exc()
         stop.set()
-        send(chat_id, "（这步脑子打结了：" + str(e)[:200] + "，再发一次试试 🐱）")
+        if "429" in str(e):
+            send(chat_id, "（这分钟的话匣子配额用完啦，过一分钟再叫我 🐱）")
+        else:
+            send(chat_id, "（这步脑子打结了：" + str(e)[:200] + "，再发一次试试 🐱）")
         return
     stop.set()
     send(chat_id, reply)
