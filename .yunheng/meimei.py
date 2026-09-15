@@ -11,7 +11,7 @@
 日志：meimei.log（stdout 重定向）
 """
 import os, sys, json, time, sqlite3, threading, traceback
-import urllib.request
+import urllib.request, urllib.error
 
 HOME = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,7 +30,7 @@ def load_env():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
-                env[k.strip()] = v.strip()
+                env[k.strip()] = v.strip().strip('"').strip("'").strip()
     return env
 
 ENV = load_env()
@@ -45,10 +45,19 @@ def http_json(url, body=None, timeout=60, headers=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "meimei/2.0")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode(errors="replace")[:400]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {detail or e.reason} [url={url}]") from e
 
 def tg(method, **params):
     return http_json(TG + "/" + method, body=params or {}, timeout=65)
