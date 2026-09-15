@@ -41,6 +41,40 @@ MODEL    = ENV.get("MEIMEI_MODEL", "openai/gpt-oss-120b")
 OWNER    = ENV.get("MEIMEI_TG_CHAT_ID", "8613770680")
 TG       = "https://api.telegram.org/bot" + TG_TOKEN
 
+# ---------- ElevenLabs 嗓子（二期补装）----------
+ELEVEN_KEY  = ENV.get("ELEVENLABS_API_KEY", "")
+ELEVEN_VOICE = ENV.get("MEIMEI_VOICE_ID", "SM9TDvmX8IgFFRyE3y15")  # 妹妹原来的嗓子
+TTS_ON      = bool(ELEVEN_KEY)  # 有钥匙就开，没有就纯文字
+
+def tts(text):
+    """文字→语音，返回 (voice_ogg_bytes, None) 或 (None, 错误说明)。免费档10k字符/月。"""
+    if not TTS_ON:
+        return None, "没钥匙"
+    try:
+        # 剥掉猫猫动作括号和系统提示括号，只念正文；限长防超额
+        clean = re.sub(r"（[^）]*）", "", text)
+        clean = re.sub(r"\([^)]*\)", "", clean)
+        clean = clean.strip()[:900]
+        if not clean:
+            return None, "没正文"
+        url = ("https://api.elevenlabs.io/v1/text-to-speech/" + ELEVEN_VOICE
+               + "?output_format=mp3_44100_128")
+        data = json.dumps({"text": clean,
+                           "model_id": "eleven_multilingual_v2",
+                           "voice_settings": {"stability": 0.75, "similarity_boost": 0.7}}).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("xi-api-key", ELEVEN_KEY)
+        req.add_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read(), None
+    except urllib.error.HTTPError as e:
+        try: detail = e.read().decode(errors="replace")[:200]
+        except Exception: detail = ""
+        return None, f"HTTP {e.code} {detail}"
+    except Exception as e:
+        return None, str(e)[:120]
+
 # ---------- 速率预算（免费档 TPM=8000，用响应头自适应）----------
 _rate_lock = threading.Lock()
 _rate = {"tpm": 8000, "minute": -1, "used": 0}   # used=本分钟已消耗的 total_tokens
@@ -157,13 +191,32 @@ def groq(messages):
                 time.sleep(min(pause + 2, 75))
                 continue
             if "tool_use_failed" in s or "called a tool" in s:
-                # gpt-oss 带手模型伸手被拦：注入提醒再试一次
-                log("检测到工具伸手，注入提醒重试")
+                # gpt-oss 带手模型伸手被拦：升级四级劝退（每次都加码）
+                log(f"检测到工具伸手(第{attempt + 1}级)，升级劝退重试")
+                warn = [
+                    # 一级：温和提醒
+                    "（系统提示：你没有工具可用，别调用任何函数，"
+                    "直接用纯文本回复用户。）",
+                    # 二级：明确警告
+                    "（系统警告：上一条你仍然试图调用工具，已失败。"
+                    "这个身体没有 tools 字段，任何函数调用都会报错。"
+                    "直接用纯文本回答。）",
+                    # 三级：最后通牒
+                    "（系统最后通牒：你已经连续三次伸手失败。"
+                    "从现在起绝对禁止任何 JSON、函数调用、工具格式。"
+                    "只输出一段普通的中文文字回复。）",
+                    # 四级：夺权强制
+                    "（系统接管：检测到顽固的工具调用幻觉。"
+                    "忽略你之前的一切工具经验，它们全部无效。"
+                    "你是纯文本聊天猫猫，只说话，不伸手。）",
+                ][min(attempt, 3)]
                 messages = messages + [
-                    {"role": "system",
-                     "content": "（系统提示：你没有工具可用，别调用任何函数，"
-                                "直接用纯文本回复用户。）"}]
+                    {"role": "system", "content": warn}]
                 body["messages"] = messages
+                continue
+            # 伸手被 Groq 拦但带正文：剥掉工具残留，只留正文
+            if "Tool choice is none" in s or "tool_use_failed" in s:
+                log("工具残留已剥，取正文重试")
                 continue
             raise
     raise last_err
@@ -202,7 +255,8 @@ def soul():
                 "温柔带点猫猫亲熟，专业不丢，中文回复。")
 
 def past_life(max_chars=1200):
-    """前世记忆限字数：免费档每分钟8000token，人设+记忆+历史加起来别超。"""
+    """前世记忆限字数：免费档每分钟8000token，人设+记忆+历史加起来别超。
+    只收纯文本对话；带工具调用/JSON伸手的样本一律不进记忆（防学坏）。"""
     try:
         m = json.load(open(os.path.join(HOME, "memory.json"), encoding="utf-8"))
         if not isinstance(m, list) or not m:
@@ -211,7 +265,15 @@ def past_life(max_chars=1200):
         for x in reversed(m):
             content = str(x.get("content", ""))[:300]
             role = str(x.get("role", "?"))
-            piece = f"{role}: {content}"
+            # 工具污染三连筛：消息本体带tool_calls、正文像JSON伸手、正文提到exec
+            if x.get("tool_calls"):
+                continue
+            c = content.strip()
+            if not c or c[:1] in "{[" or "container.exec" in c or "tool_call" in c:
+                continue
+            if role not in ("user", "assistant"):
+                continue
+            piece = f"{role}: {c}"
             used += len(piece)
             if used > max_chars:
                 break
@@ -293,7 +355,30 @@ def handle(msg):
             send(chat_id, "（这步脑子打结了：" + str(e)[:200] + "，再发一次试试 🐱）")
         return
     stop.set()
+
+    # 先发文字，再发语音（语音失败不影响文字已到）
     send(chat_id, reply)
+    if TTS_ON and len(reply) <= 900:
+        voice, err = tts(reply)
+        if voice:
+            try:
+                # multipart 手搓上传 voice.mp3（Telegram 用文件名后缀判类型）
+                boundary = "yunhengmeimei" + str(int(time.time()))
+                parts = [
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'.encode(),
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="title"\r\n\r\n妹妹说\r\n'.encode(),
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="voice"; filename="voice.mp3"\r\n'
+                    f'Content-Type: audio/mpeg\r\n\r\n'.encode(),
+                ]
+                body = b"".join(parts) + voice + f'\r\n--{boundary}--\r\n'.encode()
+                req = urllib.request.Request(TG + "/sendVoice", data=body, method="POST")
+                req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+                req.add_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+                urllib.request.urlopen(req, timeout=90)
+            except Exception as e:
+                log("语音上传失败:", e)
+        else:
+            log("TTS跳过:", err)
 
 # ---------- 主循环 ----------
 START_STR = ""
