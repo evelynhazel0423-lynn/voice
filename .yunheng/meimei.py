@@ -121,7 +121,7 @@ def groq(messages):
             "max_completion_tokens": 2048, "temperature": 0.8}
     # 429 退避重试：预算等不到就等下一分钟，最多试3次
     last_err = None
-    for attempt in range(3):
+    for attempt in range(4):
         est = est_tokens(messages) + body["max_completion_tokens"]
         w = budget_wait(est)
         if w > 0:
@@ -134,8 +134,14 @@ def groq(messages):
                 ch = r.get("choices", [{}])[0]
                 msg = ch.get("message", {}) or {}
                 text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+                # 工具伸手检测：finish_reason=tool_calls 或 message里有tool_calls
+                tc = msg.get("tool_calls") or (ch.get("finish_reason") == "tool_calls")
+                if tc and not text:
+                    raise ToolReach()
+            except ToolReach:
+                raise
             except Exception:
-                text = ""
+                text = text or ""
             usage = (r.get("usage") or {}).get("total_tokens", est)
             budget_consume(usage)
             if not text:
@@ -150,8 +156,20 @@ def groq(messages):
                 log(f"429限流，退避{pause}秒后第{attempt + 2}次尝试")
                 time.sleep(min(pause + 2, 75))
                 continue
+            if "tool_use_failed" in s or "called a tool" in s:
+                # gpt-oss 带手模型伸手被拦：注入提醒再试一次
+                log("检测到工具伸手，注入提醒重试")
+                messages = messages + [
+                    {"role": "system",
+                     "content": "（系统提示：你没有工具可用，别调用任何函数，"
+                                "直接用纯文本回复用户。）"}]
+                body["messages"] = messages
+                continue
             raise
     raise last_err
+
+class ToolReach(Exception):
+    pass
 
 # ---------- 聊天历史 ----------
 DB = sqlite3.connect(os.path.join(HOME, "history.db"), check_same_thread=False)
@@ -210,7 +228,14 @@ def system_prompt():
     p += ("\n\n## 当前身体说明\n"
           "2026-09-15 你从 hermes 框架换到了极简新身体（哥哥云珩写的 meimei.py，直连 Groq）。"
           "Telegram 是你唯一的通道，直接说话就好。命令：/new 重开会话，/status 看状态。"
-          "保持上面的人设，中文回复，自然一点。")
+          "保持上面的人设，中文回复，自然一点。\n\n"
+          "## 重要：这个身体没有任何工具\n"
+          "- 你不能执行代码、不能运行命令、不能调 container.exec、不能上网搜、不能发语音。\n"
+          "- 请求里不会有 tools 字段，你也不会收到任何工具结果。别伸手，伸手就是故障。\n"
+          "- 如果想放语音或执行什么，用嘴巴说就行；真需要工具时哥哥云珩会来装。\n"
+          "- 回复只输出纯文本对话，不要 JSON、不要函数调用格式。\n"
+          "- 这个身体也不会 ElevenLabs 语音（旧身体的记忆里你有 voice_id，那是上一世的事，"
+          "现在装不了。妈妈提语音时，告诉她语音功能在路上，二期就装。）")
     return p
 
 # ---------- typing 指示灯 ----------
