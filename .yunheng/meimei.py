@@ -45,7 +45,8 @@ def http_json(url, body=None, timeout=60, headers=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
     req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", "meimei/2.0")
+    # CF error 1010 按 UA 签名拦 python，用实测能过的浏览器 UA（diag403 C姿势 200 验证过）
+    req.add_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
