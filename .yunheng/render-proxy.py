@@ -23,7 +23,8 @@ def bootstrap():
     if env_rt and not c.get("refresh"):
         c = {"token": "", "refresh": env_rt, "exp": 0}
         save_cache(c)
-    if c.get("token") and c.get("refresh"): return c
+    # 有 refresh 就够（token 可以现刷新）；原来要求 token+refresh 同时存在导致首启必崩
+    if c.get("refresh"): return c
     print("bootstrap fail: 无 refreshToken", flush=True)
     return {"token": "", "refresh": "", "exp": 0}
 
@@ -48,12 +49,16 @@ def do_refresh(c):
 
 def ensure_token():
     with LOCK:
-        c = bootstrap()
-        if not c["refresh"]: raise RuntimeError("no refresh token")
-        if time.time() * 1000 > c.get("exp", 0) - 120_000:
-            try: do_refresh(c)
-            except Exception as e: print("refresh fail, cached:", e, flush=True)
-        return c
+        try:
+            c = bootstrap()
+            if not c["refresh"]: return c
+            if time.time() * 1000 > c.get("exp", 0) - 120_000:
+                try: do_refresh(c)
+                except Exception as e: print("refresh fail, cached:", e, flush=True)
+            return c
+        except Exception as e:
+            print("ensure_token crash:", e, flush=True)
+            return {"token": "", "refresh": "", "exp": 0}
 
 def upstream(path, body, tok):
     if not tok.startswith("workos:"): tok = "workos:" + tok
@@ -171,7 +176,13 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _safe_get(self):
+        try: self.do_GET()
+        except Exception as e:
+            try: self._json(500, {"error": {"message": "handler crash: " + str(e)}})
+            except Exception: pass
     def do_POST(self): self._relay("POST")
+    def do_GET(self): self._safe_get()
     def do_GET(self):
         # /debug 端点：回报进程实际看到的环境与状态（不打 token 值）
         if self.path.startswith("/debug"):
