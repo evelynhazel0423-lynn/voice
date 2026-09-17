@@ -190,7 +190,7 @@ class H(BaseHTTPRequestHandler):
             self._json(502, {"error": {"message": str(e)}})
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8899
+    port = int(os.environ.get("PORT", "8899"))
     bootstrap()
     srv = ThreadingHTTPServer(("0.0.0.0", port), H)
     print("cline-relay cloud listening :" + str(port), flush=True)
