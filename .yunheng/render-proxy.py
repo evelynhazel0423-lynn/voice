@@ -173,6 +173,20 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self): self._relay("POST")
     def do_GET(self):
+        # /debug 端点：回报进程实际看到的环境与状态（不打 token 值）
+        if self.path.startswith("/debug"):
+            env_keys = sorted(k for k in os.environ if not k.lower().startswith("render_"))
+            env_keys = [k for k in env_keys if "TOKEN" not in k.upper() and "KEY" not in k.upper() and "SECRET" not in k.upper()]
+            c = load_cache()
+            self._json(200, {
+                "port_env": os.environ.get("PORT"),
+                "listen_intent": "env PORT or 8899",
+                "env_keys": env_keys,
+                "has_refresh_in_env": bool(os.environ.get("CLINE_REFRESH_TOKEN", "").strip()),
+                "cache": {"has_token": bool(c.get("token")), "has_refresh": bool(c.get("refresh")), "exp": c.get("exp")},
+                "cwd": os.getcwd(),
+                "script_exists": os.path.exists(os.path.abspath(__file__)),
+            }); return
         path = self.path[3:] if self.path.startswith("/v1/") else self.path
         if "models" not in path:
             self._json(404, {"error": "not found"}); return
