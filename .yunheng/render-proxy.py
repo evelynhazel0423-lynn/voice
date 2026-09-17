@@ -112,7 +112,7 @@ class H(BaseHTTPRequestHandler):
         r = call(path, body)
         if isinstance(r, Exception):
             self._json(502, {"error": {"message": f"relay: {r}"}}); return
-        if r.status != 200:
+        if not isinstance(r, urllib.request.Request) and getattr(r, "status", 200) != 200:
             raw = r.read()
             self._json(r.status, {"error": {"message": raw.decode(errors="replace")[:500]}})
             return
@@ -191,6 +191,8 @@ class H(BaseHTTPRequestHandler):
         if "models" not in path:
             self._json(404, {"error": "not found"}); return
         c = ensure_token()
+        if not c["refresh"]:
+            self._json(503, {"error": {"message": "no refresh token configured"}}); return
         tok = c["token"]
         if not tok.startswith("workos:"): tok = "workos:" + tok
         req = urllib.request.Request(GW + path,
